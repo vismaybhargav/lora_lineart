@@ -1,0 +1,7 @@
+{
+    "include": ["."],
+    "extraPaths": [
+        "../..",
+        "../ComfyUI_nunchaku/",
+    ]
+}
