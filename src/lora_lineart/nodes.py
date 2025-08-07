@@ -1,6 +1,9 @@
 from inspect import cleandoc
-from nodes import KSampler, VAEDecode, VAELoader, VAEEncode, folder_paths
-import comfy.samplers
+
+from nodes import KSampler, VAEDecode, VAEEncode, CLIPTextEncode, ConditioningZeroOut
+from comfy_extras.nodes_flux import FluxKontextImageScale, FluxGuidance
+from comfy_extras.nodes_edit_model import ReferenceLatent
+from comfy.samplers import KSampler as KSample
 import torch
 
 
@@ -56,19 +59,8 @@ class LoraLineart:
         return {
             "required": {
                 "images": ("IMAGE", {"tooltip": "This is an image"}),
-                "model": (folder_paths.get_filename_list_("models"), {"tooltip": "The model to use for generating the image."}),
-                "lora_name": (folder_paths.get_filename_list_("loras"), {"tooltip": "The Lora to load"}),
-                "lora_strength": (
-                    "FLOAT",
-                    {
-                        "default": 1.0,
-                        "min": -100.0,
-                        "max": 100.0,
-                        "step": 0.01,
-                        "tooltip": "How strongly to modify the diffusion model. This value can be negative",
-                    },
-                ),
-                "vae_name": (list(VAELoader.vae_list()), {"tooltip": "The VAE to load"}),
+                "model": ("MODEL", {"tooltip": "The model to use for generating the image."}),
+                "vae": ("VAE",),
                 "seed": (
                     "INT",
                     {
@@ -92,15 +84,13 @@ class LoraLineart:
                     },
                 ),
                 "sampler_name": (
-                    comfy.samplers.KSampler.SAMPLERS,
+                    KSample.SAMPLERS,
                     {"tooltip": "The algorithm used when sampling, this can affect the quality, speed, and style of the generated output."},
                 ),
                 "scheduler": (
-                    comfy.samplers.KSampler.SCHEDULERS,
+                    KSample.SCHEDULERS,
                     {"tooltip": "The scheduler controls how noise is gradually removed to form the image."},
                 ),
-                "positive": ("CONDITIONING", {"tooltip": "The conditioning describing the attributes you want to include in the image."}),
-                "negative": ("CONDITIONING", {"tooltip": "The conditioning describing the attributes you want to exclude from the image."}),
                 "denoise": (
                     "FLOAT",
                     {
@@ -111,9 +101,8 @@ class LoraLineart:
                         "tooltip": "The amount of denoising applied, lower values will maintain the structure of the initial image allowing for image to image sampling.",
                     },
                 ),
-                "clip_name1": (folder_paths.get_filename_list_("text_encoders"),),
-                "clip_name2": (folder_paths.get_filename_list_("text_encoders"),),
-                "type": (["sdxl", "sd3", "flux", "hunyuan_video", "hidream"]),
+                "guidance": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "clip": ("CLIP", {"tooltip": "The CLIP model used for encoding the text."}),
                 "prompt": ("STRING", {"multiline": True}),
             },
         }
@@ -132,53 +121,84 @@ class LoraLineart:
         self,
         images,
         model,
-        vae_name,
+        vae,
         seed,
         steps,
         cfg,
         sampler_name,
         scheduler,
-        positive,
-        negative,
         denoise,
-        clip_name1,
-        clip_name2,
-        type,
+        guidance,
+        clip,
         prompt,
     ):
-        # TODO: Load Nunchaku Model and Lora Loader
-        # model_loader = NunchakuFluxDiTLoader.load_model(model)
-        # lora = []
-        vae = VAELoader().load_vae(vae_name)[0]  # vae
         vae_encode = VAEEncode()
         vae_decode = VAEDecode()
         ksampler = KSampler()
-        # dual_clip_loader = DualCLIPLoader()
+        flux_kontext_image_scale = FluxKontextImageScale()
+        clip_text_encode = CLIPTextEncode()
+        reference_latent = ReferenceLatent()
+        flux_guidance = FluxGuidance()
+        conditioning_zero_out = ConditioningZeroOut()
 
+        (cond_text,) = clip_text_encode.encode(clip, prompt)
+        (cond_text_neg,) = conditioning_zero_out.zero_out(cond_text)
+
+        frames = []
         if isinstance(images, torch.Tensor):
-            if images.ndim == 3:
-                images = [images]  # convert to list
-            elif images.ndim == 4:
-                images = [img for img in images]  # split the batch
-        elif not isinstance(images, (list, tuple)):
-            images = [images]
+            # [B, H, W, C]
+            if images.ndim == 4:
+                for i in range(images.shape[0]):
+                    frames.append(images[i])
+            # [H, W, C] not a batch
+            elif images.ndim == 3:
+                frames.append(images)
+            else:
+                raise ValueError(f"Unexpected image shape! Getting shape: {tuple(images.shape)}")
+        elif isinstance(images, (list, tuple)):
+            for im in images:
+                if not isinstance(im, torch.Tensor):
+                    raise TypeError("Each image must be a torch.Tensor")
+                if im.ndim == 4 and im.shape[0] == 1:
+                    im = im[0]
+                if im.ndim != 3:
+                    raise ValueError(f"Unexpected per-frame shape: {tuple(im.shape)}")
+                frames.append(im)
+        else:
+            raise TypeError("Images must be torch.Tensor or list/tuple of tensors.")
 
+        decoded_frames = []
         for im in images:
-            # Seems like comfy needs it to be a torch tensor
-            if not isinstance(im, torch.Tensor):
-                im = torch.from_numpy(im)
-
             if im.ndim == 3:
-                im = im.unsqueeze(0)
+                im_b = im.unsqueeze(0)
+            else:
+                im_b = im
 
-            encoded_latent = vae_encode.encode(vae, im)[0]
+            (scaled_im,) = flux_kontext_image_scale.scale(im_b)
 
-            ksampler.sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, encoded_latent, denoise)
+            (encoded_latent,) = vae_encode.encode(vae, scaled_im)
 
-            decoded = vae_decode.decode(vae, encoded_latent)[0]
+            (cond_with_ref_pos,) = reference_latent.append(conditioning=cond_text, latent=encoded_latent)
+            (cond_pos,) = flux_guidance.append(cond_with_ref_pos, guidance)
+
+            (cond_with_ref_neg,) = reference_latent.append(cond_text_neg, encoded_latent)
+            (cond_neg,) = flux_guidance.append(cond_with_ref_neg, guidance)
+
+            (new_latent,) = ksampler.sample(model, seed, steps, cfg, sampler_name, scheduler, cond_pos, cond_neg, encoded_latent, denoise)
+
+            (decoded,) = vae_decode.decode(vae, new_latent)
 
             if decoded.ndim == 4 and decoded.shape[0] == 1:
-                decoded = decoded[0]
+                decoded_frame = decoded[0]
+            elif decoded.ndim == 3:
+                decoded_frame = decoded
+            else:
+                raise ValueError(f"Unexpected decoded shape: {tuple(decoded.shape)}")
+
+            decoded_frames.append(decoded_frame)
+
+        out = torch.stack(decoded_frames, dim=0)
+        return (out,)
 
     """
         The node will always be re executed if any of the inputs change but
