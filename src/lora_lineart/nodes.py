@@ -75,7 +75,7 @@ class LoraLineart:
                 "cfg": (
                     "FLOAT",
                     {
-                        "default": 8.0,
+                        "default": 1.0,
                         "min": 0.0,
                         "max": 100.0,
                         "step": 0.1,
@@ -101,7 +101,7 @@ class LoraLineart:
                         "tooltip": "The amount of denoising applied, lower values will maintain the structure of the initial image allowing for image to image sampling.",
                     },
                 ),
-                "guidance": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "guidance": ("FLOAT", {"default": 2.5, "min": 0.0, "max": 100.0, "step": 0.1}),
                 "clip": ("CLIP", {"tooltip": "The CLIP model used for encoding the text."}),
                 "prompt": ("STRING", {"multiline": True}),
             },
